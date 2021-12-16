@@ -33,7 +33,7 @@ for i in 0..10 {
 assert_eq!(*vec_mut, (0..10).collect::<Vec<_>>());
 ```
 
-[TypeErasedVec]: https://docs.rs/type_erased_vec/0.1.1/type_erased_vec/struct.TypeErasedVec.html
-[TypeErasedVec::get]: https://docs.rs/type_erased_vec/0.1.1/type_erased_vec/struct.TypeErasedVec.html#method.get
-[TypeErasedVec::get_mut]: https://docs.rs/type_erased_vec/0.1.1/type_erased_vec/struct.TypeErasedVec.html#method.get_mut
+[TypeErasedVec]: https://docs.rs/type_erased_vec/latest/type_erased_vec/struct.TypeErasedVec.html
+[TypeErasedVec::get]: https://docs.rs/type_erased_vec/latest/type_erased_vec/struct.TypeErasedVec.html#method.get
+[TypeErasedVec::get_mut]: https://docs.rs/type_erased_vec/latest/type_erased_vec/struct.TypeErasedVec.html#method.get_mut
 [Vec]: https://doc.rust-lang.org/nightly/alloc/vec/struct.Vec.html

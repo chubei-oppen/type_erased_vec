@@ -50,7 +50,7 @@ use std::{
 
 #[derive(Debug)]
 /// A type erased [Vec].
-pub struct TypeErasedVec<A: Allocator> {
+pub struct TypeErasedVec<A: Allocator = Global> {
     alloc: Option<A>,
     layout: Layout,
     ptr: *mut u8,
