@@ -1,6 +1,6 @@
 //! This crate provides a single struct [TypeErasedVec], which (as its name says) is a type erased [Vec].
 //!
-//! When you know what its type is, you can get a [Vec] back using [TypeErasedVec::get] or [TypeErasedVec::get_mut].
+//! When you know what its type is, you can get a slice or [Vec] back using [TypeErasedVec::get] or [TypeErasedVec::get_mut].
 //!
 //! # Motivation
 //!
@@ -104,12 +104,21 @@ impl<A: Allocator> TypeErasedVec<A> {
         vec
     }
 
+    /// Gets a reference to [T].
+    ///
+    /// # Safety
+    ///
+    /// See [TypeErasedVec::into_vec].
+    pub unsafe fn get<T: Copy>(&self) -> &[T] {
+        std::slice::from_raw_parts(self.ptr.cast(), self.len)
+    }
+
     /// Gets a pointer to `Vec<T>`.
     ///
     /// # Safety
     ///
     /// See [TypeErasedVec::into_vec].
-    pub unsafe fn get<T: Copy>(&self) -> VecRef<T, A> {
+    pub unsafe fn get_ref<T: Copy>(&self) -> VecRef<T, A> {
         VecRef::new(self)
     }
 
@@ -229,7 +238,7 @@ mod tests {
     #[test]
     fn test_new() {
         let vec = TypeErasedVec::new::<i32>();
-        let vec_ref = unsafe { vec.get::<i32>() };
+        let vec_ref = unsafe { vec.get_ref::<i32>() };
         assert_eq!(vec_ref.len(), 0);
         assert_eq!(vec_ref.capacity(), 0);
     }
@@ -237,7 +246,7 @@ mod tests {
     #[test]
     fn test_with_capacity() {
         let vec = TypeErasedVec::with_capacity::<i32>(42);
-        assert_eq!(unsafe { vec.get::<i32>().capacity() }, 42);
+        assert_eq!(unsafe { vec.get_ref::<i32>().capacity() }, 42);
     }
 
     #[test]
@@ -265,5 +274,19 @@ mod tests {
         drop(vec_mut);
         let vec_ref = unsafe { vec.get::<i32>() };
         assert_eq!((0..10).collect::<Vec<_>>(), *vec_ref);
+    }
+
+    #[test]
+    fn test_get_slice() {
+        let vec = if true {
+            TypeErasedVec::new::<i32>()
+        } else {
+            TypeErasedVec::new::<f64>()
+        };
+        let _: &[u8] = if true {
+            bytemuck::cast_slice(unsafe { vec.get::<i32>() })
+        } else {
+            bytemuck::cast_slice(unsafe { vec.get::<f64>() })
+        };
     }
 }

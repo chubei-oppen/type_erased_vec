@@ -2,7 +2,7 @@
 
 This crate provides a single struct [TypeErasedVec], which (as its name says) is a type erased [Vec].
 
-When you know what its type is, you can get a [Vec] back using [TypeErasedVec::get] or [TypeErasedVec::get_mut].
+When you know what its type is, you can get a slice or [Vec] back using [TypeErasedVec::get] or [TypeErasedVec::get_mut].
 
 # Motivation
 
