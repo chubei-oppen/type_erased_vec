@@ -1,6 +1,6 @@
 [package]
 name = "type_erased_vec"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 authors = ["chubei<chubei@oppentech.com>"]
 license = "MIT"
