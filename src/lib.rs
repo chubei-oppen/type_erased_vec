@@ -40,22 +40,29 @@
     unused_qualifications
 )]
 #![feature(allocator_api)]
+#![feature(slice_ptr_get)]
+#![feature(alloc_layout_extra)]
 
 use std::{
-    alloc::{Allocator, Global, Layout},
-    mem::{align_of, forget, size_of, ManuallyDrop},
+    alloc::{handle_alloc_error, Allocator, Global, Layout},
+    mem::{forget, ManuallyDrop},
     ops::{Deref, DerefMut},
-    ptr::NonNull,
+    ptr::{copy_nonoverlapping, NonNull},
 };
 
 #[derive(Debug)]
 /// A type erased [Vec].
 pub struct TypeErasedVec<A: Allocator = Global> {
+    /// The allocator, is only None after [TypeErasedVec::get_mut] and restored to `Some` after [VecMut] destruction.
     alloc: Option<A>,
-    layout: Layout,
+    /// Pointer to memory, may be dangling.
     ptr: *mut u8,
+    /// Length of the `Vec`.
     len: usize,
+    /// Capacity of the `Vec`.
     cap: usize,
+    /// Layout of `T`. Not the layout of `ptr`.
+    layout: Layout,
 }
 
 impl<A: Allocator> TypeErasedVec<A> {
@@ -72,17 +79,12 @@ impl<A: Allocator> TypeErasedVec<A> {
     /// Erases the type of `vec`.
     pub fn from_vec<T: Copy>(vec: Vec<T, A>) -> Self {
         let (ptr, len, cap, alloc) = vec.into_raw_parts_with_alloc();
-        let layout = unsafe {
-            let size = size_of::<T>() * cap;
-            let align = align_of::<T>();
-            Layout::from_size_align_unchecked(size, align)
-        };
         TypeErasedVec {
             alloc: Some(alloc),
-            layout,
             ptr: ptr.cast(),
             len,
             cap,
+            layout: Layout::new::<T>(),
         }
     }
 
@@ -104,7 +106,7 @@ impl<A: Allocator> TypeErasedVec<A> {
         vec
     }
 
-    /// Gets a reference to [T].
+    /// Gets a reference to \[T\].
     ///
     /// # Safety
     ///
@@ -113,7 +115,9 @@ impl<A: Allocator> TypeErasedVec<A> {
         std::slice::from_raw_parts(self.ptr.cast(), self.len)
     }
 
-    /// Gets a pointer to `Vec<T>`.
+    /// Gets a smart pointer to `Vec<T>`.
+    ///
+    /// This is usually not want you want. Check [TypeErasedVec::get] instead.
     ///
     /// # Safety
     ///
@@ -122,13 +126,31 @@ impl<A: Allocator> TypeErasedVec<A> {
         VecRef::new(self)
     }
 
-    /// Gets a mutable pointer to `Vec<T>`.
+    /// Gets a smart pointer to `mut Vec<T>`.
     ///
     /// # Safety
     ///
     /// See [TypeErasedVec::into_vec].
     pub unsafe fn get_mut<T: Copy>(&mut self) -> VecMut<T, A> {
         VecMut::new(self)
+    }
+
+    /// Gets a reference to the underlying allocator.
+    pub fn allocator(&self) -> &A {
+        self.alloc.as_ref().unwrap()
+    }
+
+    fn memory(&self) -> Option<Layout> {
+        if self.layout.size() > 0 && self.cap > 0 {
+            Some(unsafe {
+                Layout::from_size_align_unchecked(
+                    self.layout.size() * self.cap,
+                    self.layout.align(),
+                )
+            })
+        } else {
+            None
+        }
     }
 }
 
@@ -146,13 +168,40 @@ impl TypeErasedVec<Global> {
 
 impl<A: Allocator> Drop for TypeErasedVec<A> {
     fn drop(&mut self) {
-        if self.layout.size() > 0 {
+        if let Some(layout) = self.memory() {
             unsafe {
                 self.alloc
                     .as_ref()
                     .unwrap()
-                    .deallocate(NonNull::new(self.ptr).unwrap(), self.layout)
+                    .deallocate(NonNull::new(self.ptr).unwrap(), layout)
             }
+        };
+    }
+}
+
+impl<A: Allocator + Clone> Clone for TypeErasedVec<A> {
+    fn clone(&self) -> Self {
+        let alloc = self.alloc.as_ref().unwrap().clone();
+        let ptr = match self.memory() {
+            Some(layout) => {
+                let ptr = match alloc.allocate(layout) {
+                    Ok(ptr) => ptr,
+                    Err(_) => handle_alloc_error(layout),
+                }
+                .as_mut_ptr();
+                unsafe {
+                    copy_nonoverlapping(self.ptr, ptr, self.len * self.layout.size());
+                }
+                ptr
+            }
+            None => self.layout.dangling().as_ptr(),
+        };
+        TypeErasedVec {
+            alloc: Some(alloc),
+            ptr,
+            len: self.len,
+            cap: self.cap,
+            layout: self.layout,
         }
     }
 }
@@ -265,6 +314,20 @@ mod tests {
     }
 
     #[test]
+    fn test_get() {
+        let vec = if true {
+            TypeErasedVec::new::<i32>()
+        } else {
+            TypeErasedVec::new::<f64>()
+        };
+        let _: &[u8] = if true {
+            bytemuck::cast_slice(unsafe { vec.get::<i32>() })
+        } else {
+            bytemuck::cast_slice(unsafe { vec.get::<f64>() })
+        };
+    }
+
+    #[test]
     fn test_get_mut() {
         let mut vec = TypeErasedVec::new::<i32>();
         let mut vec_mut = unsafe { vec.get_mut::<i32>() };
@@ -277,16 +340,11 @@ mod tests {
     }
 
     #[test]
-    fn test_get_slice() {
-        let vec = if true {
-            TypeErasedVec::new::<i32>()
-        } else {
-            TypeErasedVec::new::<f64>()
-        };
-        let _: &[u8] = if true {
-            bytemuck::cast_slice(unsafe { vec.get::<i32>() })
-        } else {
-            bytemuck::cast_slice(unsafe { vec.get::<f64>() })
-        };
+    fn test_clone() {
+        let vec = TypeErasedVec::from_vec((0..10).collect::<Vec<i32>>());
+        let clone = vec.clone();
+        unsafe {
+            assert_eq!(vec.get::<i32>(), clone.get::<i32>());
+        }
     }
 }
