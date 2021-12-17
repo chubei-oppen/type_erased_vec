@@ -16,6 +16,17 @@
 //! The second option makes all types holding that buffer generic over `T`, which is not feasible when `T` must be determined at runtime.
 //! For example, buffers can be loaded from a 3D model file on disk, where the file contains type information to be passed to the 3D renderer.
 //!
+//! # Leaking
+//!
+//! `TypeErasedVec` (and its companion struct [VecMut]), as other RAII types, relies on the destructor being called to correctly release resources.
+//! Failing to do so can cause memory leak, for example, through the use of [std::mem::forget].
+//!
+//! What's more, the content of `TypeErasedVec` is only valid after `VecMut`'s destructor is called.
+//!
+//! A `TypeErasedVec` is said to be in `leaked` state if the destructor of the returned `VecMut` of a previous call to `get_mut` didn't run.
+//!
+//! Calling any method except for [TypeErasedVec::is_leaked] on a leaked `TypeErasedVec` results in panic.
+//!
 //! # Example
 //!
 //! ```
@@ -88,6 +99,11 @@ impl<A: Allocator> TypeErasedVec<A> {
         }
     }
 
+    /// Returns if `self` is leaked.
+    pub fn is_leaked(&self) -> bool {
+        self.alloc.is_none()
+    }
+
     /// Converts to `Vec<T>`.
     ///
     /// # Safety
@@ -95,6 +111,10 @@ impl<A: Allocator> TypeErasedVec<A> {
     /// `T` must be the same type used constructing this `TypeErasedVec`.
     ///
     /// Constructors include `new`, `new_in`, `with_capacity`, `with_capacity_in`, `from_vec`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `self` is leaked.
     pub unsafe fn into_vec<T: Copy>(mut self) -> Vec<T, A> {
         let vec = Vec::from_raw_parts_in(
             self.ptr.cast(),
@@ -111,19 +131,13 @@ impl<A: Allocator> TypeErasedVec<A> {
     /// # Safety
     ///
     /// See [TypeErasedVec::into_vec].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `self` is leaked.
     pub unsafe fn get<T: Copy>(&self) -> &[T] {
+        assert!(!self.is_leaked());
         std::slice::from_raw_parts(self.ptr.cast(), self.len)
-    }
-
-    /// Gets a smart pointer to `Vec<T>`.
-    ///
-    /// This is usually not want you want. Check [TypeErasedVec::get] instead.
-    ///
-    /// # Safety
-    ///
-    /// See [TypeErasedVec::into_vec].
-    pub unsafe fn get_ref<T: Copy>(&self) -> VecRef<T, A> {
-        VecRef::new(self)
     }
 
     /// Gets a smart pointer to `mut Vec<T>`.
@@ -131,12 +145,22 @@ impl<A: Allocator> TypeErasedVec<A> {
     /// # Safety
     ///
     /// See [TypeErasedVec::into_vec].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `self` is leaked.
     pub unsafe fn get_mut<T: Copy>(&mut self) -> VecMut<T, A> {
+        assert!(!self.is_leaked());
         VecMut::new(self)
     }
 
     /// Gets a reference to the underlying allocator.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `self` is leaked.
     pub fn allocator(&self) -> &A {
+        assert!(!self.is_leaked());
         self.alloc.as_ref().unwrap()
     }
 
@@ -164,16 +188,31 @@ impl TypeErasedVec<Global> {
     pub fn with_capacity<T: Copy>(capacity: usize) -> Self {
         Self::with_capacity_in::<T>(capacity, Global)
     }
+
+    /// Gets a smart pointer to `Vec<T>`.
+    ///
+    /// This is usually not want you want. Check [TypeErasedVec::get] instead.
+    ///
+    /// This method is only implemented for `TypeErasedVec<Global>` because we can't get a `Vec` back without giving it a allocator.
+    ///
+    /// # Safety
+    ///
+    /// See [TypeErasedVec::into_vec].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `self` is leaked.
+    pub unsafe fn get_ref<T: Copy>(&self) -> VecRef<T> {
+        assert!(!self.is_leaked());
+        VecRef::new(self)
+    }
 }
 
 impl<A: Allocator> Drop for TypeErasedVec<A> {
     fn drop(&mut self) {
         if let Some(layout) = self.memory() {
-            unsafe {
-                self.alloc
-                    .as_ref()
-                    .unwrap()
-                    .deallocate(NonNull::new(self.ptr).unwrap(), layout)
+            if let Some(alloc) = self.alloc.take() {
+                unsafe { alloc.deallocate(NonNull::new(self.ptr).unwrap(), layout) }
             }
         };
     }
@@ -181,7 +220,10 @@ impl<A: Allocator> Drop for TypeErasedVec<A> {
 
 impl<A: Allocator + Clone> Clone for TypeErasedVec<A> {
     fn clone(&self) -> Self {
+        assert!(!self.is_leaked());
+
         let alloc = self.alloc.as_ref().unwrap().clone();
+
         let ptr = match self.memory() {
             Some(layout) => {
                 let ptr = match alloc.allocate(layout) {
@@ -196,6 +238,7 @@ impl<A: Allocator + Clone> Clone for TypeErasedVec<A> {
             }
             None => self.layout.dangling().as_ptr(),
         };
+
         TypeErasedVec {
             alloc: Some(alloc),
             ptr,
@@ -208,22 +251,20 @@ impl<A: Allocator + Clone> Clone for TypeErasedVec<A> {
 
 #[derive(Debug)]
 /// `Deref`s to `Vec<T, Global>`.
-///
-/// The allocator will always be [Global]. It won't be used anyway.
-pub struct VecRef<'a, T: Copy, A: Allocator> {
-    raw: &'a TypeErasedVec<A>,
+pub struct VecRef<'a, T: Copy> {
+    raw: &'a TypeErasedVec<Global>,
     vec: ManuallyDrop<Vec<T, Global>>,
 }
 
-impl<'a, T: Copy, A: Allocator> VecRef<'a, T, A> {
-    fn new(raw: &'a TypeErasedVec<A>) -> Self {
+impl<'a, T: Copy> VecRef<'a, T> {
+    fn new(raw: &'a TypeErasedVec<Global>) -> Self {
         let vec =
             unsafe { ManuallyDrop::new(Vec::from_raw_parts(raw.ptr as *mut T, raw.len, raw.cap)) };
         VecRef { raw, vec }
     }
 }
 
-impl<'a, T: Copy, A: Allocator> Deref for VecRef<'a, T, A> {
+impl<'a, T: Copy> Deref for VecRef<'a, T> {
     type Target = Vec<T, Global>;
 
     fn deref(&self) -> &Vec<T, Global> {
@@ -231,7 +272,7 @@ impl<'a, T: Copy, A: Allocator> Deref for VecRef<'a, T, A> {
     }
 }
 
-impl<'a, T: Copy, A: Allocator> Clone for VecRef<'a, T, A> {
+impl<'a, T: Copy> Clone for VecRef<'a, T> {
     fn clone(&self) -> Self {
         Self::new(self.raw)
     }
