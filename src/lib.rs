@@ -34,12 +34,14 @@
 //!
 //! let mut vec = TypeErasedVec::new::<i32>();
 //!
-//! let mut vec_mut = unsafe { vec.get_mut() };
-//! for i in 0..10 {
-//!     vec_mut.push(i);
+//! {
+//!     let mut vec_mut = unsafe { vec.get_mut() };
+//!     for i in 0..10 {
+//!         vec_mut.push(i);
+//!     }
 //! }
 //!
-//! assert_eq!(*vec_mut, (0..10).collect::<Vec<_>>());
+//! assert_eq!(unsafe { vec.get::<i32>() }, (0..10).collect::<Vec<_>>());
 //! ```
 
 #![deny(
