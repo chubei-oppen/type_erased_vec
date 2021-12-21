@@ -51,57 +51,112 @@
     unused_qualifications
 )]
 #![feature(allocator_api)]
-#![feature(slice_ptr_get)]
-#![feature(alloc_layout_extra)]
 
 use std::{
-    alloc::{handle_alloc_error, Allocator, Global, Layout},
+    alloc::{Allocator, Global},
     mem::{forget, ManuallyDrop},
     ops::{Deref, DerefMut},
-    ptr::{copy_nonoverlapping, NonNull},
 };
+
+mod raw {
+    use super::{Allocator, Global, ManuallyDrop};
+
+    #[derive(Debug)]
+    /// The raw parts of a `Vec`.
+    ///
+    /// This struct is leaking. It doesn't call the destructor of the elements or deallocate memory.
+    pub struct RawVec<A: Allocator> {
+        ptr: *mut u8,
+        len: usize,
+        cap: usize,
+        alloc: A,
+    }
+
+    impl<A: Allocator> RawVec<A> {
+        pub fn from_vec<T>(vec: Vec<T, A>) -> Self {
+            let (ptr, len, cap, alloc) = vec.into_raw_parts_with_alloc();
+            RawVec {
+                ptr: ptr.cast(),
+                len,
+                cap,
+                alloc,
+            }
+        }
+
+        pub fn allocator(&self) -> &A {
+            &self.alloc
+        }
+
+        /// # Safety
+        ///
+        /// `T` must be the same as in `from_vec`.
+        pub unsafe fn into_vec<T>(self) -> Vec<T, A> {
+            Vec::from_raw_parts_in(self.ptr.cast(), self.len, self.cap, self.alloc)
+        }
+
+        /// # Safety
+        ///
+        /// `T` must be the same as in `from_vec`.
+        pub unsafe fn as_slice<T>(&self) -> &[T] {
+            std::slice::from_raw_parts(self.ptr.cast(), self.len)
+        }
+    }
+
+    impl RawVec<Global> {
+        /// # Safety
+        /// - `T` must be the same as in `from_vec`.
+        /// - Returned value must not outlive underlying memory.
+        /// - Multiple return values of this method must not be dropped more than once.
+        pub unsafe fn as_manually_drop_vec<T>(&self) -> ManuallyDrop<Vec<T, Global>> {
+            ManuallyDrop::new(Vec::from_raw_parts_in(
+                self.ptr.cast(),
+                self.len,
+                self.cap,
+                self.alloc,
+            ))
+        }
+    }
+
+    /// # Safety
+    ///
+    /// `T` must be the same as in `from_vec`.
+    pub unsafe fn drop_raw_vec<T, A: Allocator>(raw: RawVec<A>) {
+        drop(raw.into_vec::<T>());
+    }
+}
+
+use raw::{drop_raw_vec, RawVec};
 
 #[derive(Debug)]
 /// A type erased [Vec].
 pub struct TypeErasedVec<A: Allocator = Global> {
-    /// The allocator, is only None after [TypeErasedVec::get_mut] and restored to `Some` after [VecMut] destruction.
-    alloc: Option<A>,
-    /// Pointer to memory, may be dangling.
-    ptr: *mut u8,
-    /// Length of the `Vec`.
-    len: usize,
-    /// Capacity of the `Vec`.
-    cap: usize,
-    /// Layout of `T`. Not the layout of `ptr`.
-    layout: Layout,
+    /// The raw form of the `Vec`. It's only None after [TypeErasedVec::get_mut] and restored to `Some` after [VecMut] destruction.
+    raw: Option<RawVec<A>>,
+    drop: unsafe fn(RawVec<A>),
 }
 
 impl<A: Allocator> TypeErasedVec<A> {
     /// Constructs a new, empty `TypeErasedVec`. See [Vec::new_in].
-    pub fn new_in<T: Copy>(alloc: A) -> Self {
+    pub fn new_in<T>(alloc: A) -> Self {
         Self::from_vec(Vec::<T, A>::new_in(alloc))
     }
 
     /// Constructs a new, empty `TypeErasedVec` with specified capacity. See [Vec::with_capacity_in].
-    pub fn with_capacity_in<T: Copy>(capacity: usize, alloc: A) -> Self {
+    pub fn with_capacity_in<T>(capacity: usize, alloc: A) -> Self {
         Self::from_vec(Vec::<T, A>::with_capacity_in(capacity, alloc))
     }
 
     /// Erases the type of `vec`.
-    pub fn from_vec<T: Copy>(vec: Vec<T, A>) -> Self {
-        let (ptr, len, cap, alloc) = vec.into_raw_parts_with_alloc();
+    pub fn from_vec<T>(vec: Vec<T, A>) -> Self {
         TypeErasedVec {
-            alloc: Some(alloc),
-            ptr: ptr.cast(),
-            len,
-            cap,
-            layout: Layout::new::<T>(),
+            raw: Some(RawVec::from_vec(vec)),
+            drop: drop_raw_vec::<T, A>,
         }
     }
 
     /// Returns if `self` is leaked.
     pub fn is_leaked(&self) -> bool {
-        self.alloc.is_none()
+        self.raw.is_none()
     }
 
     /// Converts to `Vec<T>`.
@@ -115,13 +170,8 @@ impl<A: Allocator> TypeErasedVec<A> {
     /// # Panics
     ///
     /// Panics if `self` is leaked.
-    pub unsafe fn into_vec<T: Copy>(mut self) -> Vec<T, A> {
-        let vec = Vec::from_raw_parts_in(
-            self.ptr.cast(),
-            self.len,
-            self.cap,
-            self.alloc.take().unwrap(),
-        );
+    pub unsafe fn into_vec<T>(mut self) -> Vec<T, A> {
+        let vec = self.raw.take().unwrap().into_vec();
         forget(self);
         vec
     }
@@ -135,9 +185,8 @@ impl<A: Allocator> TypeErasedVec<A> {
     /// # Panics
     ///
     /// Panics if `self` is leaked.
-    pub unsafe fn get<T: Copy>(&self) -> &[T] {
-        assert!(!self.is_leaked());
-        std::slice::from_raw_parts(self.ptr.cast(), self.len)
+    pub unsafe fn get<T>(&self) -> &[T] {
+        self.raw.as_ref().unwrap().as_slice()
     }
 
     /// Gets a smart pointer to `mut Vec<T>`.
@@ -149,8 +198,7 @@ impl<A: Allocator> TypeErasedVec<A> {
     /// # Panics
     ///
     /// Panics if `self` is leaked.
-    pub unsafe fn get_mut<T: Copy>(&mut self) -> VecMut<T, A> {
-        assert!(!self.is_leaked());
+    pub unsafe fn get_mut<T>(&mut self) -> VecMut<T, A> {
         VecMut::new(self)
     }
 
@@ -160,32 +208,18 @@ impl<A: Allocator> TypeErasedVec<A> {
     ///
     /// Panics if `self` is leaked.
     pub fn allocator(&self) -> &A {
-        assert!(!self.is_leaked());
-        self.alloc.as_ref().unwrap()
-    }
-
-    fn memory(&self) -> Option<Layout> {
-        if self.layout.size() > 0 && self.cap > 0 {
-            Some(unsafe {
-                Layout::from_size_align_unchecked(
-                    self.layout.size() * self.cap,
-                    self.layout.align(),
-                )
-            })
-        } else {
-            None
-        }
+        self.raw.as_ref().unwrap().allocator()
     }
 }
 
 impl TypeErasedVec<Global> {
     /// Constructs a new, empty `TypeErasedVec`. See [Vec::new].
-    pub fn new<T: Copy>() -> Self {
+    pub fn new<T>() -> Self {
         Self::new_in::<T>(Global)
     }
 
     /// Constructs a new, empty `TypeErasedVec` with specified capacity. See [Vec::with_capacity].
-    pub fn with_capacity<T: Copy>(capacity: usize) -> Self {
+    pub fn with_capacity<T>(capacity: usize) -> Self {
         Self::with_capacity_in::<T>(capacity, Global)
     }
 
@@ -202,69 +236,40 @@ impl TypeErasedVec<Global> {
     /// # Panics
     ///
     /// Panics if `self` is leaked.
-    pub unsafe fn get_ref<T: Copy>(&self) -> VecRef<T> {
-        assert!(!self.is_leaked());
+    pub unsafe fn get_ref<T>(&self) -> VecRef<T> {
         VecRef::new(self)
     }
 }
 
 impl<A: Allocator> Drop for TypeErasedVec<A> {
     fn drop(&mut self) {
-        if let Some(layout) = self.memory() {
-            if let Some(alloc) = self.alloc.take() {
-                unsafe { alloc.deallocate(NonNull::new(self.ptr).unwrap(), layout) }
+        if let Some(raw) = self.raw.take() {
+            let drop = self.drop;
+            unsafe {
+                drop(raw);
             }
-        };
-    }
-}
-
-impl<A: Allocator + Clone> Clone for TypeErasedVec<A> {
-    fn clone(&self) -> Self {
-        assert!(!self.is_leaked());
-
-        let alloc = self.alloc.as_ref().unwrap().clone();
-
-        let ptr = match self.memory() {
-            Some(layout) => {
-                let ptr = match alloc.allocate(layout) {
-                    Ok(ptr) => ptr,
-                    Err(_) => handle_alloc_error(layout),
-                }
-                .as_mut_ptr();
-                unsafe {
-                    copy_nonoverlapping(self.ptr, ptr, self.len * self.layout.size());
-                }
-                ptr
-            }
-            None => self.layout.dangling().as_ptr(),
-        };
-
-        TypeErasedVec {
-            alloc: Some(alloc),
-            ptr,
-            len: self.len,
-            cap: self.cap,
-            layout: self.layout,
         }
     }
 }
 
 #[derive(Debug)]
 /// `Deref`s to `Vec<T, Global>`.
-pub struct VecRef<'a, T: Copy> {
+pub struct VecRef<'a, T> {
     raw: &'a TypeErasedVec<Global>,
     vec: ManuallyDrop<Vec<T, Global>>,
 }
 
-impl<'a, T: Copy> VecRef<'a, T> {
-    fn new(raw: &'a TypeErasedVec<Global>) -> Self {
-        let vec =
-            unsafe { ManuallyDrop::new(Vec::from_raw_parts(raw.ptr as *mut T, raw.len, raw.cap)) };
+impl<'a, T> VecRef<'a, T> {
+    /// # Safety
+    ///
+    /// `T` must be what `raw` was constructred with.
+    unsafe fn new(raw: &'a TypeErasedVec<Global>) -> Self {
+        let vec = raw.raw.as_ref().unwrap().as_manually_drop_vec();
         VecRef { raw, vec }
     }
 }
 
-impl<'a, T: Copy> Deref for VecRef<'a, T> {
+impl<'a, T> Deref for VecRef<'a, T> {
     type Target = Vec<T, Global>;
 
     fn deref(&self) -> &Vec<T, Global> {
@@ -272,34 +277,30 @@ impl<'a, T: Copy> Deref for VecRef<'a, T> {
     }
 }
 
-impl<'a, T: Copy> Clone for VecRef<'a, T> {
+impl<'a, T> Clone for VecRef<'a, T> {
     fn clone(&self) -> Self {
-        Self::new(self.raw)
+        unsafe { Self::new(self.raw) }
     }
 }
 
 #[derive(Debug)]
 /// `DerefMut`s to `Vec<T, A>`.
-pub struct VecMut<'a, T: Copy, A: Allocator> {
+pub struct VecMut<'a, T, A: Allocator> {
     raw: &'a mut TypeErasedVec<A>,
     vec: Option<ManuallyDrop<Vec<T, A>>>,
 }
 
-impl<'a, T: Copy, A: Allocator> VecMut<'a, T, A> {
-    fn new(raw: &'a mut TypeErasedVec<A>) -> Self {
-        let vec = Some(unsafe {
-            ManuallyDrop::new(Vec::from_raw_parts_in(
-                raw.ptr as *mut T,
-                raw.len,
-                raw.cap,
-                raw.alloc.take().unwrap(),
-            ))
-        });
+impl<'a, T, A: Allocator> VecMut<'a, T, A> {
+    /// # Safety
+    ///
+    /// `T` must be what `raw` was constructred with.
+    unsafe fn new(raw: &'a mut TypeErasedVec<A>) -> Self {
+        let vec = Some(ManuallyDrop::new(raw.raw.take().unwrap().into_vec()));
         VecMut { raw, vec }
     }
 }
 
-impl<'a, T: Copy, A: Allocator> Deref for VecMut<'a, T, A> {
+impl<'a, T, A: Allocator> Deref for VecMut<'a, T, A> {
     type Target = Vec<T, A>;
 
     fn deref(&self) -> &Vec<T, A> {
@@ -307,13 +308,13 @@ impl<'a, T: Copy, A: Allocator> Deref for VecMut<'a, T, A> {
     }
 }
 
-impl<'a, T: Copy, A: Allocator> DerefMut for VecMut<'a, T, A> {
+impl<'a, T, A: Allocator> DerefMut for VecMut<'a, T, A> {
     fn deref_mut(&mut self) -> &mut Vec<T, A> {
         self.vec.as_mut().unwrap()
     }
 }
 
-impl<'a, T: Copy, A: Allocator> Drop for VecMut<'a, T, A> {
+impl<'a, T, A: Allocator> Drop for VecMut<'a, T, A> {
     fn drop(&mut self) {
         let vec = self.vec.take().unwrap();
         let vec = ManuallyDrop::into_inner(vec);
@@ -378,14 +379,5 @@ mod tests {
         drop(vec_mut);
         let vec_ref = unsafe { vec.get::<i32>() };
         assert_eq!((0..10).collect::<Vec<_>>(), *vec_ref);
-    }
-
-    #[test]
-    fn test_clone() {
-        let vec = TypeErasedVec::from_vec((0..10).collect::<Vec<i32>>());
-        let clone = vec.clone();
-        unsafe {
-            assert_eq!(vec.get::<i32>(), clone.get::<i32>());
-        }
     }
 }
