@@ -1,5 +1,9 @@
 # type_erased_vec
 
+[![Crate](https://img.shields.io/crates/v/type_erased_vec.svg)](https://crates.io/crates/type_erased_vec)
+![Crates.io](https://img.shields.io/crates/l/type_erased_vec.svg)
+[![API](https://docs.rs/atomic-actor/badge.svg)](https://docs.rs/type_erased_vec)
+
 This crate provides a single struct [TypeErasedVec], which (as its name says) is a type erased [Vec].
 
 When you know what its type is, you can get a slice or [Vec] back using [TypeErasedVec::get] or [TypeErasedVec::get_mut].
