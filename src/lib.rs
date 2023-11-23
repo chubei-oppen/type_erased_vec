@@ -52,16 +52,22 @@
     unused_import_braces,
     unused_qualifications
 )]
+#![cfg_attr(not(test), no_std)]
 #![feature(allocator_api)]
 
-use std::{
+extern crate alloc;
+use alloc::{
     alloc::{Allocator, Global},
+    vec::Vec,
+};
+
+use core::{
     mem::{forget, ManuallyDrop},
     ops::{Deref, DerefMut},
 };
 
 mod raw {
-    use super::{Allocator, Global, ManuallyDrop};
+    use super::{Allocator, Global, ManuallyDrop, Vec};
 
     #[derive(Debug)]
     /// The raw parts of a `Vec`.
@@ -100,7 +106,7 @@ mod raw {
         ///
         /// `T` must be the same as in `from_vec`.
         pub unsafe fn as_slice<T>(&self) -> &[T] {
-            std::slice::from_raw_parts(self.ptr.cast(), self.len)
+            alloc::slice::from_raw_parts(self.ptr.cast(), self.len)
         }
     }
 
